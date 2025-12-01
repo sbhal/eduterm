@@ -100,9 +100,108 @@
  * - Implements line buffering in canonical mode
  * - Handles echo (typing shows on screen) without your code doing anything
  *
- * WHY TWO FDs?
- * Separation of concerns. Master is for the "outside" (GUI), slave is for
- * the "inside" (programs). The kernel mediates, providing terminal semantics.
+ * WHY TWO FDs? Why not just one bidirectional FD?
+ * ================================================
+ *
+ * REASON #1: Process Isolation and Security
+ * The master and slave live in DIFFERENT processes (parent vs child).
+ *
+ * CLARIFICATION: "Parent" and "Child" are Unix process terms:
+ * - Parent = Terminal emulator (your GUI program)
+ * - Child = Shell (/bin/sh) created by fork()
+ * - Grandchildren = Programs shell runs (vim, ls, grep, etc.)
+ *
+ * Yes, the shell IS a child process of the terminal emulator!
+ * When you run vim, it becomes a child of the shell (grandchild of terminal).
+ *
+ * Process tree:
+ *   Terminal Emulator (PID 1000, has master FD)
+ *   └─ Shell (PID 1001, has slave FD as stdin/stdout/stderr)
+ *      ├─ vim (PID 1002, inherited slave FD as stdin/stdout/stderr)
+ *      └─ ls (PID 1003, inherited slave FD as stdin/stdout/stderr)
+ *
+ * After fork(), the parent closes slave, child closes master. This ensures:
+ * - Child can't interfere with terminal emulator's operations
+ * - Terminal emulator can't accidentally write to wrong end
+ * - Clean separation: each process only has the FD it needs
+ *
+ * REASON #2: The Kernel Needs to Know Direction
+ * The PTY driver treats master and slave ASYMMETRICALLY:
+ * - Data written to master → processed → appears on slave (input path)
+ * - Data written to slave → processed → appears on master (output path)
+ * - Different processing rules apply to each direction
+ *
+ * Example: In canonical mode with echo enabled:
+ *   write(master, "a", 1) → PTY echoes "a" back to master AND sends to slave
+ *   write(slave, "a", 1) → PTY sends "a" to master (no echo)
+ *
+ * REASON #3: Terminal Control Operations (ioctls)
+ * Many terminal operations only make sense on one end:
+ * - TIOCSWINSZ (set window size) → called by PARENT on master FD
+ * - TIOCSCTTY (set controlling terminal) → called by CHILD on slave FD
+ * - tcsetpgrp (set foreground process group) → called by CHILD on slave FD
+ *
+ * WHO CALLS WHAT:
+ * Terminal emulator (parent) uses master FD for:
+ *   - ioctl(master, TIOCSWINSZ, ...) to tell kernel the window size
+ *   - write(master, ...) to send keyboard input
+ *   - read(master, ...) to receive program output
+ *
+ * Shell/programs (child) use slave FD for:
+ *   - ioctl(slave, TIOCSCTTY, ...) to make PTY the controlling terminal
+ *   - read(slave, ...) to read keyboard input (this is their stdin)
+ *   - write(slave, ...) to send output (this is their stdout/stderr)
+ *
+ * The kernel needs to know which end you're operating on.
+ *
+ * REASON #4: File Descriptor Inheritance and Redirection
+ * The slave FD is DUPLICATED to become stdin/stdout/stderr in the child.
+ *
+ * CONCRETE EXAMPLE - What happens in spawn() function:
+ *
+ * Before fork():
+ *   Terminal emulator has: master=5, slave=6
+ *
+ * After fork(), in CHILD process:
+ *   1. close(master)           // Close FD 5, child doesn't need it
+ *   2. dup2(slave, 0)          // Copy FD 6 to FD 0 (stdin)
+ *   3. dup2(slave, 1)          // Copy FD 6 to FD 1 (stdout)
+ *   4. dup2(slave, 2)          // Copy FD 6 to FD 2 (stderr)
+ *   5. close(slave)            // Close FD 6, no longer needed
+ *
+ * Now child has: FD 0, 1, 2 all point to the SAME slave device
+ *
+ * When shell or vim does:
+ *   read(0, buf, 10)           // Read from stdin (FD 0 = slave)
+ *   write(1, "hello", 5)       // Write to stdout (FD 1 = slave)
+ *   write(2, "error", 5)       // Write to stderr (FD 2 = slave)
+ *
+ * All three operations go through the SAME slave FD to the PTY driver.
+ * The master FD is completely hidden from child (it was closed).
+ *
+ * WHY DUPLICATE TO 0, 1, 2?
+ * Unix convention: programs expect stdin=0, stdout=1, stderr=2.
+ * By duplicating slave to these FDs, programs work without modification.
+ * They don't know they're talking to a PTY - they think it's a real terminal.
+ *
+ * REASON #5: Historical Compatibility
+ * Real hardware terminals had two separate connections:
+ * - Computer's serial port (like our master)
+ * - Terminal's serial port (like our slave)
+ * PTYs emulate this model. Programs written for real terminals expect this.
+ *
+ * WHAT IF WE USED ONE FD?
+ * You could theoretically use a single bidirectional FD (like a socketpair),
+ * but you'd lose:
+ * - Automatic echo handling (you'd implement it yourself)
+ * - Signal generation (you'd parse ^C and send SIGINT yourself)
+ * - Line buffering (you'd implement canonical mode yourself)
+ * - Terminal modes (raw/cooked, you'd handle all of it)
+ * - Controlling terminal semantics (job control wouldn't work)
+ *
+ * The two-FD design lets the kernel's PTY driver do all this work for you.
+ * Master is for the "outside" (GUI), slave is for the "inside" (programs).
+ * The kernel mediates, providing terminal semantics automatically.
  *
  * KEY INSIGHT #4: What You Actually Have to Emulate
  * -------------------------------------------------
